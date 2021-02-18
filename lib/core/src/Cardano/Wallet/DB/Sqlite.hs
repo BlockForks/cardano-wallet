@@ -1080,8 +1080,7 @@ newDBLayer
     -> SqliteContext
        -- ^ A (thread-)safe wrapper for query execution.
     -> IO (DBLayer IO s k)
-newDBLayer =
-    newDBLayerWith @s @k CacheLatestCheckpoint
+newDBLayer = newDBLayerWith @s @k CacheLatestCheckpoint
 
 -- | Like 'newDBLayer', but allows to explicitly specify the caching behavior.
 newDBLayerWith
@@ -1115,7 +1114,7 @@ newDBLayerWith cacheBehavior ti SqliteContext{runQuery} = do
     --
     -- NOTE2
     -- When 'cacheBehavior' is set to 'NoCache', we simply never write anything
-    -- to the cache, which forces 'selectLatestCheckpoint' to always perform a
+    -- to the cache, which forces 'selectLatestCheckpointCached' to always perform a
     -- database lookup.
     cache <- newMVar Map.empty
 
@@ -1126,39 +1125,33 @@ newDBLayerWith cacheBehavior ti SqliteContext{runQuery} = do
             NoCache -> pure ()
             CacheLatestCheckpoint -> modifyMVar_ cache (pure . m)
 
-    let writeCache :: W.WalletId -> Maybe (W.Wallet s) -> SqlPersistT IO ()
-        writeCache wid = maybeUpdateCache . \case
-                Nothing -> Map.delete wid
-                Just cp ->
-                    let tip = cp ^. #currentTip . #blockHeight
-                        alter = \case
-                            Just old | tip < old ^. #currentTip .  #blockHeight ->
-                                Just old
-                            _ ->
-                                Just cp
-                    in Map.alter alter wid
+        writeCache :: W.WalletId -> Maybe (W.Wallet s) -> SqlPersistT IO ()
+        writeCache wid = maybeUpdateCache . flip Map.alter wid . maybe (const Nothing) alterCache
 
-    let selectLatestCheckpoint
+        alterCache :: W.Wallet s -> (Maybe (W.Wallet s) -> Maybe (W.Wallet s))
+        alterCache cp = \case
+            -- this seems suspicious
+            Just old | getHeight cp < getHeight old -> Just old
+            _ -> Just cp
+
+        getHeight = view (#currentTip . #blockHeight)
+
+    let selectLatestCheckpointCached
             :: W.WalletId
             -> SqlPersistT IO (Maybe (W.Wallet s))
-        selectLatestCheckpoint wid = do
-            readCache wid >>= maybe fromDatabase (pure . Just)
-          where
-            fromDatabase = do
-                mcp <- fmap entityVal <$> selectFirst
-                    [ CheckpointWalletId ==. wid ]
-                    [ LimitTo 1, Desc CheckpointSlot ]
-                case mcp of
-                    Nothing -> pure Nothing
-                    Just cp -> do
-                        utxo <- selectUTxO cp
-                        s <- selectState (checkpointId cp)
-                        pure (checkpointFromEntity @s cp utxo <$> s)
+        selectLatestCheckpointCached wid = do
+            readCache wid >>= maybe (selectLatestCheckpoint @s wid) (pure . Just)
 
+    -- fixme: not threadsafe
     let invalidateCache :: W.WalletId -> SqlPersistT IO ()
         invalidateCache wid = do
             writeCache wid Nothing
-            selectLatestCheckpoint wid >>= writeCache wid
+            cp <- selectLatestCheckpoint wid
+            writeCache wid cp
+
+    -- fixme: not threadsafe
+    let insertCheckpointCached wid cp =
+            writeCache wid (Just cp) *> insertCheckpoint wid cp
 
     return DBLayer
 
@@ -1170,7 +1163,7 @@ newDBLayerWith cacheBehavior ti SqliteContext{runQuery} = do
             res <- handleConstraint (ErrWalletAlreadyExists wid) $
                 insert_ (mkWalletEntity wid meta gp)
             when (isRight res) $ do
-                insertCheckpoint wid cp <* writeCache wid (Just cp)
+                insertCheckpointCached wid cp
                 let (metas, txins, txouts, txoutTokens, ws) =
                         mkTxHistory wid txs
                 putTxs metas txins txouts txoutTokens ws
@@ -1196,10 +1189,10 @@ newDBLayerWith cacheBehavior ti SqliteContext{runQuery} = do
                 Nothing ->
                     pure $ Left $ ErrNoSuchWallet wid
                 Just _  ->
-                    Right <$> (insertCheckpoint wid cp <* writeCache wid (Just cp))
+                    Right <$> insertCheckpointCached wid cp
 
         , readCheckpoint = \(PrimaryKey wid) -> do
-            selectLatestCheckpoint wid
+            selectLatestCheckpointCached wid
 
         , listCheckpoints = \(PrimaryKey wid) -> do
             map (blockHeaderFromEntity . entityVal) <$> selectList
@@ -1238,7 +1231,7 @@ newDBLayerWith cacheBehavior ti SqliteContext{runQuery} = do
                     pure (Right nearestPoint)
 
         , prune = \(PrimaryKey wid) epochStability -> ExceptT $ do
-            selectLatestCheckpoint wid >>= \case
+            selectLatestCheckpointCached wid >>= \case
                 Nothing -> pure $ Left $ ErrNoSuchWallet wid
                 Just cp -> Right <$> do
                     pruneCheckpoints wid epochStability cp
@@ -1257,7 +1250,7 @@ newDBLayerWith cacheBehavior ti SqliteContext{runQuery} = do
                     pure $ Right ()
 
         , readWalletMeta = \(PrimaryKey wid) -> do
-            selectLatestCheckpoint wid >>= \case
+            selectLatestCheckpointCached wid >>= \case
                 Nothing -> pure Nothing
                 Just cp -> do
                     currentEpoch <- liftIO $
@@ -1311,7 +1304,7 @@ newDBLayerWith cacheBehavior ti SqliteContext{runQuery} = do
                     pure $ Right ()
 
         , readTxHistory = \(PrimaryKey wid) minWithdrawal order range status -> do
-            selectLatestCheckpoint wid >>= \case
+            selectLatestCheckpointCached wid >>= \case
                 Nothing -> pure []
                 Just cp -> selectTxHistory cp
                     ti wid minWithdrawal order $ catMaybes
@@ -1345,7 +1338,7 @@ newDBLayerWith cacheBehavior ti SqliteContext{runQuery} = do
                             else Right ()
 
         , getTx = \(PrimaryKey wid) tid -> ExceptT $ do
-            selectLatestCheckpoint wid >>= \case
+            selectLatestCheckpointCached wid >>= \case
                 Nothing -> pure $ Left $ ErrNoSuchWallet wid
                 Just cp -> do
                     metas <- selectTxHistory cp
@@ -1772,6 +1765,21 @@ genesisParametersFromEntity (Wallet _ _ _ _ _ hash startTime) =
 selectWallet :: MonadIO m => W.WalletId -> SqlPersistT m (Maybe Wallet)
 selectWallet wid =
     fmap entityVal <$> selectFirst [WalId ==. wid] []
+
+selectLatestCheckpoint
+    :: forall s. (PersistState s)
+    => W.WalletId
+    -> SqlPersistT IO (Maybe (W.Wallet s))
+selectLatestCheckpoint wid = do
+    mcp <- fmap entityVal <$> selectFirst
+        [ CheckpointWalletId ==. wid ]
+        [ LimitTo 1, Desc CheckpointSlot ]
+    case mcp of
+        Nothing -> pure Nothing
+        Just cp -> do
+            utxo <- selectUTxO cp
+            s <- selectState (checkpointId cp)
+            pure (checkpointFromEntity @s cp utxo <$> s)
 
 insertCheckpoint
     :: forall s. (PersistState s)
