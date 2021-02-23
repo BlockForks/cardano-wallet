@@ -395,6 +395,7 @@ benchmark db
     , cardano-wallet-launcher
     , cardano-wallet-test-utils
     , containers
+    , contra-tracer
     , criterion
     , cryptonite
     , deepseq

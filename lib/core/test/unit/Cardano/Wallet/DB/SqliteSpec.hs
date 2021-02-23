@@ -46,7 +46,7 @@ import Cardano.BM.Trace
 import Cardano.Crypto.Wallet
     ( XPrv )
 import Cardano.DB.Sqlite
-    ( DBLog (..), fieldName, newInMemorySqliteContext )
+    ( DBField, DBLog (..), fieldName, newInMemorySqliteContext )
 import Cardano.Mnemonic
     ( SomeMnemonic (..) )
 import Cardano.Wallet.DB
@@ -63,6 +63,7 @@ import Cardano.Wallet.DB.Properties
 import Cardano.Wallet.DB.Sqlite
     ( DefaultFieldValues (..)
     , PersistState
+    , WalletDBLog (..)
     , newDBFactory
     , newDBLayer
     , newDBLayerInMemory
@@ -468,14 +469,14 @@ testMigrationTxMetaFee dbName expectedLength caseByCase = do
                 Just TransactionInfo{txInfoFee} ->
                     txInfoFee `shouldBe` Just expectedFee
   where
-    isMsgManualMigration :: DBLog -> Bool
-    isMsgManualMigration = \case
-        MsgManualMigrationNeeded field _ ->
-            fieldName field == unDBName fieldInDb
-        _ ->
-            False
-      where
-        fieldInDb = fieldDB $ persistFieldDef DB.TxMetaFee
+    isMsgManualMigration = matchMsgManualMigration $ \field ->
+        let fieldInDB = fieldDB $ persistFieldDef DB.TxMetaFee
+        in fieldName field == unDBName fieldInDB
+
+matchMsgManualMigration :: (DBField -> Bool) -> WalletDBLog -> Bool
+matchMsgManualMigration p = \case
+    MsgDB (MsgManualMigrationNeeded field _) -> p field
+    _ -> False
 
 testMigrationCleanupCheckpoints
     :: forall k s.
@@ -512,12 +513,9 @@ testMigrationCleanupCheckpoints dbName genesisParameters tip = do
     fieldGenesisHash = fieldDB $ persistFieldDef DB.WalGenesisHash
     fieldGenesisStart = fieldDB $ persistFieldDef DB.WalGenesisStart
 
-    isMsgManualMigration :: DBName -> DBLog -> Bool
-    isMsgManualMigration fieldInDb = \case
-        MsgManualMigrationNeeded field _ ->
-            fieldName field == unDBName fieldInDb
-        _ ->
-            False
+    isMsgManualMigration :: DBName -> WalletDBLog -> Bool
+    isMsgManualMigration fieldInDB = matchMsgManualMigration $ \field ->
+        fieldName field == unDBName fieldInDB
 
 testMigrationRole
     :: forall k s.
@@ -545,14 +543,10 @@ testMigrationRole dbName = do
         length migrationMsg `shouldBe` 3
         length (knownAddresses $ getState cp) `shouldBe` 71
   where
-    isMsgManualMigration :: DBLog -> Bool
-    isMsgManualMigration = \case
-        MsgManualMigrationNeeded field _ ->
-            fieldName field == unDBName fieldInDb
-        _ ->
-            False
-      where
-        fieldInDb = fieldDB $ persistFieldDef DB.SeqStateAddressRole
+    isMsgManualMigration :: WalletDBLog -> Bool
+    isMsgManualMigration = matchMsgManualMigration $ \field ->
+        let fieldInDB = fieldDB $ persistFieldDef DB.SeqStateAddressRole
+        in fieldName field == unDBName fieldInDB
 
 testMigrationSeqStateDerivationPrefix
     :: forall k s.
@@ -583,13 +577,9 @@ testMigrationSeqStateDerivationPrefix dbName prefix = do
         length migrationMsg `shouldBe` 1
         derivationPrefix (getState cp) `shouldBe` DerivationPrefix prefix
   where
-    isMsgManualMigration :: DBLog -> Bool
-    isMsgManualMigration = \case
-        MsgManualMigrationNeeded field _ ->
-            fieldName field ==
-                unDBName (fieldDB $ persistFieldDef DB.SeqStateDerivationPrefix)
-        _ ->
-            False
+    isMsgManualMigration = matchMsgManualMigration $ \field ->
+        let fieldInDB = fieldDB $ persistFieldDef DB.SeqStateDerivationPrefix
+        in fieldName field == unDBName fieldInDB
 
 testMigrationPassphraseScheme
     :: forall s k. (k ~ ShelleyKey, s ~ SeqState 'Mainnet k)
@@ -631,13 +621,9 @@ testMigrationPassphraseScheme = do
         -- account public key), so it should still have NO scheme.
         (passphraseScheme <$> passphraseInfo d) `shouldBe` Nothing
   where
-    isMsgManualMigration :: DBLog -> Bool
-    isMsgManualMigration = \case
-        MsgManualMigrationNeeded field _ ->
-            fieldName field ==
-                unDBName (fieldDB $ persistFieldDef DB.WalPassphraseScheme)
-        _ ->
-            False
+    isMsgManualMigration = matchMsgManualMigration $ \field ->
+        let fieldInDB = fieldDB $ persistFieldDef DB.WalPassphraseScheme
+        in  fieldName field == unDBName fieldInDB
 
     -- Coming from __test/data/passphraseScheme-v2020-03-16.sqlite__:
     --
@@ -700,8 +686,9 @@ newMemoryDBLayer'
     => IO (TVar [DBLog], DBLayer IO s k)
 newMemoryDBLayer' = do
     logVar <- newTVarIO []
-    ctx <- newInMemorySqliteContext (traceInTVarIO logVar) [] DB.migrateAll
-    (logVar,) <$> newDBLayer ti ctx
+    let trDB = traceInTVarIO logVar
+    ctx <- newInMemorySqliteContext trDB [] DB.migrateAll
+    (logVar,) <$> newDBLayer nullTracer ti ctx
   where
    ti = dummyTimeInterpreter
 
